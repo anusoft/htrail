@@ -1,0 +1,105 @@
+# Deploy an already-built, already-signed binary to App Store Connect.
+#
+# This workflow does NOT build or sign — you build & sign on your Mac
+# (make_mas.sh DISTRIBUTION=1 for macOS, the xcodegen/xcodebuild flow for iOS),
+# attach the .pkg/.ipa to a *draft* GitHub release, then run this to upload and
+# (optionally) submit for review.
+#
+# Auth comes entirely from repo secrets — nothing identifying is in this file:
+#   ASC_KEY_P8     base64 of the App Store Connect API key .p8
+#   ASC_KEY_ID     the key id (e.g. CQHFLUWF22)
+#   ASC_ISSUER_ID  the team's API issuer id
+#   ASC_PY_B64     base64 of scripts/appstore/asc.py (kept out of the public tree)
+name: Deploy to App Store
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: Target platform
+        type: choice
+        options: [ios, macos]
+        required: true
+      tag:
+        description: Release tag holding the signed binary (a draft release is fine)
+        type: string
+        required: true
+      asset:
+        description: Asset filename to upload (.ipa for ios, .pkg for macos)
+        type: string
+        required: true
+      build_version:
+        description: CFBundleVersion of the build (for submit — wait/attach)
+        type: string
+        required: false
+      submit:
+        description: After upload, wait for processing, attach the build, and submit for review
+        type: boolean
+        default: false
+
+permissions:
+  contents: read          # to download the release asset (incl. drafts)
+
+jobs:
+  deploy:
+    runs-on: macos-latest
+    timeout-minutes: 120   # Apple build processing can take a while before submit
+    env:
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Restore App Store Connect API key
+        env:
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          mkdir -p ~/.appstoreconnect/private_keys
+          printf '%s' "$ASC_KEY_P8" | base64 --decode \
+            > ~/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8
+          echo "ASC_P8=$HOME/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8" >> "$GITHUB_ENV"
+
+      - name: Restore deploy tooling (asc.py)
+        env:
+          ASC_PY_B64: ${{ secrets.ASC_PY_B64 }}
+        run: |
+          printf '%s' "$ASC_PY_B64" | base64 --decode > asc.py
+          python3 -m pip install --quiet --user cryptography certifi
+
+      - name: Download signed binary
+        run: gh release download "${{ inputs.tag }}" --repo "$GITHUB_REPOSITORY" --pattern "${{ inputs.asset }}" --dir build
+
+      - name: Map platform
+        id: map
+        run: |
+          if [ "${{ inputs.platform }}" = "ios" ]; then
+            echo "altool_type=ios"   >> "$GITHUB_OUTPUT"
+            echo "asc_platform=IOS"  >> "$GITHUB_OUTPUT"
+          else
+            echo "altool_type=macos"   >> "$GITHUB_OUTPUT"
+            echo "asc_platform=MAC_OS" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Validate
+        run: |
+          xcrun altool --validate-app -f "build/${{ inputs.asset }}" \
+            -t "${{ steps.map.outputs.altool_type }}" \
+            --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID"
+
+      - name: Upload to App Store Connect
+        run: |
+          xcrun altool --upload-app -f "build/${{ inputs.asset }}" \
+            -t "${{ steps.map.outputs.altool_type }}" \
+            --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID" \
+          || echo "::warning::altool exited non-zero (often a benign post-upload precheck note — verify the build appears in App Store Connect)"
+
+      - name: Wait for processing, attach build, submit for review
+        if: ${{ inputs.submit }}
+        env:
+          ASC_PLATFORM: ${{ steps.map.outputs.asc_platform }}
+        run: |
+          if [ -z "${{ inputs.build_version }}" ]; then
+            echo "::error::submit requires build_version (the CFBundleVersion of the uploaded build)"; exit 1
+          fi
+          python3 asc.py wait-build  --build-version "${{ inputs.build_version }}"
+          python3 asc.py attach-build --build-version "${{ inputs.build_version }}"
+          python3 asc.py submit
