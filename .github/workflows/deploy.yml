@@ -63,7 +63,10 @@ jobs:
           ASC_PY_B64: ${{ secrets.ASC_PY_B64 }}
         run: |
           printf '%s' "$ASC_PY_B64" | base64 --decode > asc.py
-          python3 -m pip install --quiet --user cryptography certifi
+          python3 -m venv "$RUNNER_TEMP/asc-venv"
+          "$RUNNER_TEMP/asc-venv/bin/python" -m pip install --quiet --upgrade pip
+          "$RUNNER_TEMP/asc-venv/bin/python" -m pip install --quiet cryptography certifi
+          echo "$RUNNER_TEMP/asc-venv/bin" >> "$GITHUB_PATH"
 
       - name: Download signed binary
         run: gh release download "${{ inputs.tag }}" --repo "$GITHUB_REPOSITORY" --pattern "${{ inputs.asset }}" --dir build
